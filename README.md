@@ -146,3 +146,7 @@ man ia_upload
 `ia configure` is the easy path. If you prefer environment variables the names
 are `IA_ACCESS_KEY_ID` and `IA_SECRET_ACCESS_KEY`. Set both or neither, since
 the library raises if only one is present.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
