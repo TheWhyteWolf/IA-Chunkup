@@ -1,0 +1,348 @@
+.\" Manpage for ia_upload.
+.TH IA_UPLOAD 1 "2026-09-03" "ia_upload 1.0" "User Commands"
+.
+.SH NAME
+ia_upload \- resilient bulk uploader for archive.org items
+.
+.SH SYNOPSIS
+.B ia_upload.py
+.I IDENTIFIER SOURCE
+.RI [ OPTIONS ]
+.
+.SH DESCRIPTION
+.B ia_upload
+uploads a file or a directory tree to a single archive.org item over IA's S3
+interface, and is built to survive the conditions that defeat
+.BR "ia upload" (1)
+on large collections: multi-gigabyte files, slow links, and IA nodes that
+stall or return 503 under load.
+.PP
+It is safe to interrupt and re-run at any point. Every run begins by reading
+the item's current file list and comparing MD5 sums, so a file that already
+landed intact is never sent twice. MD5 sums are cached between runs, keyed by
+path, size and mtime, so a re-run does not re-read the whole tree.
+.
+.SS "Why this exists"
+The
+.B internetarchive
+Python library hardcodes a 120 second request timeout
+.RB ( item.py ,
+in
+.BR upload_file ).
+That value is a
+.I read
+timeout: it bounds how long the client waits for IA's reply
+.I after
+the request body has been sent. IA writes the object to a storage node and
+checksums it before replying, so any sufficiently large file will exceed 120
+seconds while the transfer is in fact working perfectly. The result is
+.PP
+.RS
+.nf
+requests.exceptions.ReadTimeout: (ReadTimeoutError("HTTPSConnectionPool(
+host='s3.us.archive.org', port=443): Read timed out. (read timeout=120)"))
+.fi
+.RE
+.PP
+.B ia_upload
+scales that timeout with file size (see
+.BR "TIMEOUTS" )
+and, when a timeout does occur, re-reads the item's file list to check whether
+the upload actually succeeded before spending another full transfer on it.
+.PP
+Note that the body itself is always streamed from disk in small blocks by
+.BR requests ,
+never buffered in memory. Chunking the read side is neither necessary nor
+sufficient to fix a read timeout.
+.
+.SS "Relationship to ia upload"
+The
+.BR ia (1)
+command-line client exposes no timeout option at all, so the 120 second limit
+cannot be raised from it. Its
+.B \-\-retries
+option retries only on HTTP 503 and on IA's "S3 overloaded" pre-check; a
+.B ReadTimeout
+propagates immediately and is never retried, however high the count is set.
+.B ia_upload
+owns its retry loop and treats timeouts, connection resets, and all retryable
+HTTP statuses as recoverable.
+.
+.SH OPTIONS
+.
+.SS "What to send"
+.TP
+.B \-\-dry\-run
+List what would be uploaded and exit. Contacts the item to read its file list
+but sends nothing, and needs no credentials. Always worth running first.
+.TP
+.BR \-\-metadata ", " \-m " " \fIKEY:VALUE\fR
+Item metadata, repeatable. Metadata is only applied by the request that
+creates the item, so this has no effect on an item that already exists; use
+.B ia metadata
+for those. Repeating a key builds a list.
+.IP
+.B "An item with no title or description is frequently rejected as spam."
+Set at least
+.B \-m 'title:...'
+and
+.B \-m 'description:...'
+when creating one.
+.TP
+.BI \-\-exclude " GLOB"
+Skip files and directories whose name matches this shell glob, repeatable.
+Matching is against the base name, not the full path. Excluded directories are
+not descended into.
+.TP
+.B \-\-include\-hidden
+Include dotfiles and dot-directories, which are skipped by default.
+.
+.SS Derivation
+.TP
+.B \-\-derive
+Queue IA's derivation task once every file has been sent. Derivation is
+skipped automatically if any file failed or the run was interrupted, so that
+IA does not derive a half-populated item. Without this flag, no derive is
+queued at all and you can run
+.B ia derive
+.I IDENTIFIER
+yourself later.
+.TP
+.B \-\-reduced\-priority
+Submit the derive at low priority. Slower to process, less likely to run into
+IA's task rate limits on a large item.
+.
+.SS "Retries and pacing"
+.TP
+.BI \-\-retries " N"
+Attempts per file (default: 12). Backoff is exponential with jitter, so 12
+attempts already spans several hours; there is little reason to raise it.
+.TP
+.BI \-\-retry\-wait " SEC"
+Delay before the first retry (default: 15). Doubles after each failure.
+.TP
+.BI \-\-max\-retry\-wait " SEC"
+Ceiling on the backoff delay (default: 600).
+.TP
+.BI \-\-wait\-between " SEC"
+Pause between files (default: 0). Raise this if IA starts returning 503
+consistently; it is gentler than letting every file fail into its retry loop.
+.
+.SS TIMEOUTS
+The read timeout for a file is computed as
+.PP
+.RS
+.BI min( \-\-max\-timeout ,
+.IB \-\-read\-timeout " + " \-\-timeout\-per\-gb " * size_in_GB" )
+.RE
+.PP
+With the defaults, a 100 MB file gets 630 seconds and a 20 GB file gets 6600.
+.TP
+.BI \-\-connect\-timeout " SEC"
+TCP connect timeout (default: 30).
+.TP
+.BI \-\-read\-timeout " SEC"
+Base response timeout (default: 600).
+.TP
+.BI \-\-timeout\-per\-gb " SEC"
+Additional response timeout per gigabyte (default: 300).
+.TP
+.BI \-\-max\-timeout " SEC"
+Ceiling on the response timeout (default: 7200). Must not be below
+.BR \-\-read\-timeout .
+.
+.SS Bookkeeping
+.TP
+.BI \-\-state " PATH"
+Resume-state file (default:
+.BI .ia_upload_ IDENTIFIER .json
+in the working directory). Holds cached MD5 sums and the list of files IA has
+accepted. Written atomically, mode 0600, and safe to delete at any time;
+doing so only costs a re-hash of the tree.
+.TP
+.BI \-\-log " PATH"
+Append log output to this file as well as to standard output. Anything
+resembling an IA S3 credential is redacted before it is written.
+.TP
+.B \-\-no\-verify
+Skip the final pass that re-reads the item and confirms every uploaded file's
+MD5.
+.TP
+.B \-\-trust\-state
+Skip files the state file records as accepted, even when IA's file list does
+not show them yet. IA's file list can lag minutes behind an accepted upload,
+and without this flag those files are sent again. Only files for which IA
+returned success are ever recorded, so this is sound, but the file list is
+the only real evidence the bytes are still there, which is why it is opt-in.
+Re-run without it once the item has settled.
+.TP
+.BR \-\-yes ", " \-y
+Do not prompt before overwriting a remote file whose contents differ. Required
+for unattended runs that would overwrite; without it, a non-interactive run
+that would overwrite exits 2 rather than guessing.
+.
+.SH "EXIT STATUS"
+.TP
+.B 0
+Everything uploaded and verified, or there was nothing to do.
+.TP
+.B 1
+Some files failed, or could not be confirmed on the item afterwards. Re-run
+the identical command to retry only those.
+.TP
+.B 2
+Bad usage, bad identifier, unreadable source, missing credentials, a filename
+IA will reject, or a refused overwrite.
+.TP
+.B 130
+Interrupted. Re-run to continue where it stopped.
+.
+.SH ENVIRONMENT
+.TP
+.B IA_ACCESS_KEY_ID
+.TQ
+.B IA_SECRET_ACCESS_KEY
+IA S3 credentials. Both must be set, or neither. Usually unnecessary: running
+.B ia configure
+once writes them to the config file instead.
+.TP
+.B IA_CONFIG_FILE
+Alternative path to the
+.B ia
+configuration file.
+.
+.SH FILES
+.TP
+.I ~/.config/internetarchive/ia.ini
+Credentials written by
+.BR "ia configure" .
+.TP
+.IB .ia_upload_ IDENTIFIER .json
+Default resume state, in the working directory.
+.
+.SH EXAMPLES
+.PP
+Check first. This sends nothing and needs no credentials:
+.PP
+.RS
+.nf
+ia_upload.py Game-maps-collection ./maps/ --dry\-run
+.fi
+.RE
+.PP
+Create the item and upload a tree, logging to a file:
+.PP
+.RS
+.nf
+ia_upload.py Game-maps-collection ./maps/ \\
+    -m 'title:Game Maps Collection' \\
+    -m 'description:Community map packs, 1999-2007.' \\
+    -m 'mediatype:software' \\
+    -m 'collection:opensource' \\
+    --derive --log upload.log
+.fi
+.RE
+.PP
+Resume after an interruption. This is the identical command, and it re-sends
+only what is missing:
+.PP
+.RS
+.nf
+ia_upload.py Game-maps-collection ./maps/ --derive --log upload.log
+.fi
+.RE
+.PP
+A link that keeps dropping, or an item IA is throttling:
+.PP
+.RS
+.nf
+ia_upload.py Game-maps-collection ./maps/ \\
+    --retries 30 --wait-between 10 --max-retry-wait 900
+.fi
+.RE
+.PP
+Skip editor litter and OS metadata:
+.PP
+.RS
+.nf
+ia_upload.py Game-maps-collection ./maps/ \\
+    --exclude '*.tmp' --exclude '.DS_Store' --exclude 'Thumbs.db'
+.fi
+.RE
+.
+.SH NOTES
+.SS "Migrating from ia upload"
+.TP
+.B \-\-checksum
+Default behaviour, and cheaper: the item's file list is read once per run
+rather than per file, and local MD5 sums are cached between runs.
+.TP
+.B \-\-verify
+Always on. Every request carries a
+.B Content\-MD5
+header computed from the cached sum, so IA verifies the object server-side.
+This is strictly better than the library's own
+.BR verify=True ,
+which re-reads the entire file from disk on every attempt.
+.TP
+.BI \-\-retries " N"
+Use
+.BI \-\-retries " N"
+here, but a large value is not needed: this retry loop covers timeouts and
+connection failures, which the library's does not, and backs off
+exponentially rather than sleeping a fixed interval.
+.TP
+.BI \-\-sleep " SEC"
+Closest equivalent is
+.BI \-\-retry\-wait " SEC"
+(the first delay, which then doubles up to
+.BR \-\-max\-retry\-wait ).
+.PP
+So
+.B "ia upload ID DIR --checksum --verify --retries 150 --sleep 15"
+becomes simply
+.B "ia_upload.py ID DIR" .
+The defaults already cover it.
+.
+.SS "Things that are skipped"
+Symbolic links are never followed, so nothing outside
+.I SOURCE
+can be uploaded by accident. Empty files are skipped: IA accepts them, but
+they are almost always an artifact of an interrupted copy. Both are reported.
+.
+.SS "Filenames"
+Remote names are the paths relative to
+.IR SOURCE ,
+with
+.B /
+separators, so the directory structure is preserved on the item. Before
+anything is sent, names are checked for control characters, over-long names,
+empty or space-padded path segments, and case-insensitive collisions. IA
+rejects or silently mangles all of these, and they are far cheaper to find
+now than four hours into a run.
+.
+.SS Overwriting
+Uploading a file whose name already exists on the item but whose contents
+differ replaces it, and IA retains the previous copy as a versioned file that
+still counts against the item's size. The run stops to confirm before doing
+this unless
+.B \-\-yes
+is given.
+.
+.SS "Verification lag"
+IA's file list is updated asynchronously, so the verification pass at the end
+of a run can legitimately report files it cannot yet see. This is usually
+timing rather than loss; re-running later confirms them, and anything
+genuinely missing is re-sent. See
+.BR \-\-trust\-state .
+.
+.SH "SEE ALSO"
+.BR ia (1)
+.PP
+.UR https://archive.org/developers/ias3.html
+IAS3 API documentation
+.UE
+.PP
+.UR https://github.com/jjjake/internetarchive
+internetarchive, the underlying Python library
+.UE

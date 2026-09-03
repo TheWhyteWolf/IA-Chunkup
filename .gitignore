@@ -1,0 +1,12 @@
+# Resume state written by ia_upload.py
+.ia_upload_*.json
+.ia_upload_*.json.tmp
+
+# Logs
+*.log
+
+# Build artifacts
+*.tar.gz
+
+__pycache__/
+*.py[cod]
