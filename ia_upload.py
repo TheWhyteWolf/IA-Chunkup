@@ -343,6 +343,7 @@ class State:
     hashes: dict = field(default_factory=dict)
     completed: dict = field(default_factory=dict)
     _dirty: bool = False
+    _saving: bool = False
 
     @staticmethod
     def _key(f: LocalFile) -> str:
@@ -384,21 +385,31 @@ class State:
     def save(self, force: bool = False) -> None:
         if not (self._dirty or force):
             return
-        payload = {
-            "version": STATE_VERSION,
-            "identifier": self.identifier,
-            "hashes": self.hashes,
-            "completed": self.completed,
-        }
-        tmp = self.path.with_name(self.path.name + ".tmp")
+        if self._saving:
+            # A second Ctrl-C runs its abort handler synchronously on this
+            # same thread, so this is reentrancy, not a cross-thread race.
+            # Both calls would write the same shared .tmp path; let the
+            # in-flight save finish instead of interleaving with it.
+            return
+        self._saving = True
         try:
-            tmp.write_text(json.dumps(payload), encoding="utf-8")
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, self.path)   # atomic; survives a kill mid-write
-            self._dirty = False
-        except OSError as e:
-            log.warning("Could not save resume state: %s", e)
-            tmp.unlink(missing_ok=True)
+            payload = {
+                "version": STATE_VERSION,
+                "identifier": self.identifier,
+                "hashes": self.hashes,
+                "completed": self.completed,
+            }
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            try:
+                tmp.write_text(json.dumps(payload), encoding="utf-8")
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, self.path)   # atomic; survives a kill mid-write
+                self._dirty = False
+            except OSError as e:
+                log.warning("Could not save resume state: %s", e)
+                tmp.unlink(missing_ok=True)
+        finally:
+            self._saving = False
 
     def hash_for(self, f: LocalFile) -> str:
         key = self._key(f)
@@ -469,7 +480,15 @@ def acquire_lock(path: Path) -> None:
                 f"  If that run is truly gone, delete the lock file and retry."
             )
         path.unlink(missing_ok=True)
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            # Another process reclaimed the same stale lock in the gap
+            # between our unlink and open. Let that run have it.
+            raise SystemExit(
+                f"Another ia_upload run just claimed this state file "
+                f"(lock: {path}). Re-run once it finishes."
+            )
     with os.fdopen(fd, "w") as fh:
         fh.write(str(os.getpid()))
     atexit.register(path.unlink, missing_ok=True)
@@ -653,7 +672,7 @@ def human(n: float) -> str:
     return f"{n:.1f}PB"
 
 
-def rolling_rate(window: deque[tuple[float, int]], now: float, size: int, elapsed: float) -> float:
+def rolling_rate(window: deque[tuple[float, float, int]], now: float, size: int, elapsed: float) -> float:
     """Record a completed file and return bytes/sec over a recent window.
 
     A plain lifetime average (total bytes / total elapsed since the run
@@ -661,11 +680,16 @@ def rolling_rate(window: deque[tuple[float, int]], now: float, size: int, elapse
     run, long after conditions recover. This looks only at RATE_WINDOW_SECONDS
     of recent history instead, aging out anything older.
     """
-    window.append((now, size))
+    window.append((now, elapsed, size))
     while window and now - window[0][0] > RATE_WINDOW_SECONDS:
         window.popleft()
-    window_bytes = sum(s for _, s in window)
-    window_span = max(now - window[0][0], elapsed, 0.001)
+    window_bytes = sum(s for _, _, s in window)
+    # The window's true span runs from the *start* of the oldest transfer
+    # (its completion time minus its own duration) to now. Using just the
+    # completion time here would drop the oldest file's transfer time from
+    # the denominator while still counting its bytes in the numerator,
+    # inflating the rate.
+    window_span = max(now - (window[0][0] - window[0][1]), elapsed, 0.001)
     return window_bytes / window_span
 
 
@@ -968,7 +992,7 @@ def main() -> int:
     # (timestamp, bytes) of recent completions, for a recency-weighted ETA.
     # A plain lifetime average would stay dragged down by an early retry
     # storm for the rest of the run, long after conditions recover.
-    rate_window: deque[tuple[float, int]] = deque()
+    rate_window: deque[tuple[float, float, int]] = deque()
     stop_all = False
 
     for i, f in enumerate(pending, 1):
@@ -985,6 +1009,9 @@ def main() -> int:
             continue
         if st.st_size != f.size or int(st.st_mtime) != int(f.mtime):
             log.warning("[%d/%d] %s changed on disk, re-hashing.", i, len(pending), f.remote_name)
+            size_diff = st.st_size - f.size
+            total_bytes += size_diff
+            pending_bytes += size_diff
             f.size, f.mtime = st.st_size, st.st_mtime
             f.md5 = state.hash_for(f)
 
@@ -1028,25 +1055,28 @@ def main() -> int:
     if succeeded and not args.no_verify and not interrupt.requested:
         log.info("Letting the item settle, then verifying...")
         interrupt.sleep(30)
-        try:
-            final = remote_manifest(args.identifier)
-            unconfirmed = [f.remote_name for f in succeeded
-                           if final.get(f.remote_name) != f.md5]
-            if unconfirmed:
-                log.warning(
-                    "%d file(s) not confirmed on the item yet. IA's file list "
-                    "lags behind uploads, so this is often just timing. "
-                    "Re-run this command later and anything genuinely missing "
-                    "will be re-sent:", len(unconfirmed),
-                )
-                for name in unconfirmed[:20]:
-                    log.warning("    %s", name)
-                if len(unconfirmed) > 20:
-                    log.warning("    ... and %d more", len(unconfirmed) - 20)
-            else:
-                log.info("Verified: all %d uploaded files match.", len(succeeded))
-        except (RuntimeError, FatalRemoteError) as e:
-            log.warning("Verification skipped: %s", e)
+        if interrupt.requested:
+            log.info("Interrupted during settle wait; skipping verification.")
+        else:
+            try:
+                final = remote_manifest(args.identifier)
+                unconfirmed = [f.remote_name for f in succeeded
+                               if final.get(f.remote_name) != f.md5]
+                if unconfirmed:
+                    log.warning(
+                        "%d file(s) not confirmed on the item yet. IA's file list "
+                        "lags behind uploads, so this is often just timing. "
+                        "Re-run this command later and anything genuinely missing "
+                        "will be re-sent:", len(unconfirmed),
+                    )
+                    for name in unconfirmed[:20]:
+                        log.warning("    %s", name)
+                    if len(unconfirmed) > 20:
+                        log.warning("    ... and %d more", len(unconfirmed) - 20)
+                else:
+                    log.info("Verified: all %d uploaded files match.", len(succeeded))
+            except (RuntimeError, FatalRemoteError) as e:
+                log.warning("Verification skipped: %s", e)
 
     # ---- Derive -----------------------------------------------------------
     if args.derive and succeeded and not failed and not interrupt.requested:
