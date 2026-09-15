@@ -35,6 +35,7 @@ Exit codes: 0 ok, 1 some files failed, 2 bad usage/credentials, 130 interrupted.
 from __future__ import annotations
 
 import argparse
+import atexit
 import fnmatch
 import hashlib
 import json
@@ -46,6 +47,7 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -99,6 +101,7 @@ def ia_generated_names(identifier: str) -> set[str]:
 STATE_VERSION = 3
 MAX_REMOTE_NAME_BYTES = 240          # IA rejects very long keys
 HEARTBEAT_SECONDS = 60
+RATE_WINDOW_SECONDS = 600            # ETA looks at recent throughput, not the run's whole history
 
 # Redact anything shaped like IA's S3 auth header before logging.
 _SECRET_RE = re.compile(r"(LOW\s+)[A-Za-z0-9]+:[A-Za-z0-9]+", re.IGNORECASE)
@@ -187,6 +190,7 @@ class Heartbeat:
 
     def __exit__(self, *exc) -> None:
         self._stop.set()
+        self._thread.join(timeout=1)
 
 
 # --------------------------------------------------------------------------
@@ -216,6 +220,12 @@ def discover(root: Path, exclude: list[str], include_hidden: bool) -> list[Local
         # --include-hidden and the empty-file skip do not silently change
         # meaning depending on whether the source is a file or a directory.
         name = root.name
+        if root.is_symlink():
+            log.warning(
+                "%s is a symlink; symlinks are never followed. Pass the "
+                "real path if you want to upload its target.", root
+            )
+            return []
         if not include_hidden and name.startswith("."):
             log.warning("%s is hidden; pass --include-hidden to upload it.", root)
             return []
@@ -271,12 +281,19 @@ def discover(root: Path, exclude: list[str], include_hidden: bool) -> list[Local
     return sorted(found, key=lambda f: f.remote_name)
 
 
-def check_names(files: list[LocalFile]) -> list[str]:
+def check_names(files: list[LocalFile], identifier: str) -> list[str]:
     """Flag names IA will reject, before we waste hours discovering it."""
     problems = []
     seen: dict[str, str] = {}
+    generated = ia_generated_names(identifier)
     for f in files:
         name = f.remote_name
+        if name in generated:
+            problems.append(
+                f"{f.path}: remote name '{name}' matches a file IA generates "
+                f"itself on this item; it will never be recognized as "
+                f"uploaded and will be re-sent every run. Rename it."
+            )
         if any(ord(c) < 32 or ord(c) == 127 for c in name):
             problems.append(f"{f.path}: contains control characters")
         if len(name.encode("utf-8")) > MAX_REMOTE_NAME_BYTES:
@@ -344,8 +361,15 @@ class State:
         except (json.JSONDecodeError, OSError, ValueError, UnicodeDecodeError) as e:
             log.warning("State file unusable (%s); starting fresh.", e)
             return s
-        if data.get("version") != STATE_VERSION or data.get("identifier") != identifier:
-            log.info("State file does not match this run; starting fresh.")
+        if data.get("version") != STATE_VERSION:
+            log.info("State file is from a different version; starting fresh.")
+            return s
+        if data.get("identifier") != identifier:
+            log.warning(
+                "%s holds state for a different item ('%s', expected '%s'); "
+                "starting fresh. Its contents will be overwritten on save.",
+                path, data.get("identifier"), identifier,
+            )
             return s
         if isinstance(data.get("hashes"), dict):
             s.hashes = data["hashes"]
@@ -414,6 +438,43 @@ class State:
         return self.completed.get(f.remote_name) == f.md5
 
 
+def acquire_lock(path: Path) -> None:
+    """Refuse to start if another run is already using this state file.
+
+    Without this, an overlapping cron run and a manual run can race on the
+    same state file, each silently discarding the other's progress records.
+    Released automatically on interpreter exit via atexit, which also fires
+    for sys.exit() (including from the interrupt handler), so no explicit
+    release call is needed at main()'s many return points.
+    """
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        stale = False
+        try:
+            pid = int(path.read_text().strip())
+        except (OSError, ValueError):
+            stale = True  # lock file unreadable or garbage; safe to reclaim
+        else:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                stale = True          # that pid is definitely gone
+            except OSError:
+                pass                  # exists but we can't signal it; assume running
+        if not stale:
+            raise SystemExit(
+                f"Another ia_upload run appears to be using this state file "
+                f"already (lock: {path}).\n"
+                f"  If that run is truly gone, delete the lock file and retry."
+            )
+        path.unlink(missing_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(str(os.getpid()))
+    atexit.register(path.unlink, missing_ok=True)
+
+
 # --------------------------------------------------------------------------
 # Remote inspection
 # --------------------------------------------------------------------------
@@ -436,8 +497,9 @@ def remote_manifest(identifier: str, attempts: int = 5) -> dict:
                 if f.name not in generated
             }
         except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
             text = safe(e)
-            if "401" in text or "403" in text:
+            if status in (401, 403):
                 raise FatalRemoteError(
                     f"Access denied reading item '{identifier}'.\n"
                     f"  Check the identifier spelling, and that your keys have "
@@ -445,10 +507,10 @@ def remote_manifest(identifier: str, attempts: int = 5) -> dict:
                 ) from e
             if attempt == attempts:
                 break
-            wait = min(60, 2 ** attempt)
+            wait = min(60, 2 ** attempt) * (0.5 + random.random())
             log.warning(
                 "Could not read the item's file list (attempt %d/%d): %s "
-                "; retrying in %ds", attempt, attempts, text, wait,
+                "; retrying in %s", attempt, attempts, text, clock(wait),
             )
             time.sleep(wait)
     raise RuntimeError(f"Gave up reading the file list for '{identifier}'")
@@ -479,7 +541,7 @@ def classify(exc: Exception) -> tuple[bool, str]:
             body = (resp.text or "")[:400] if resp is not None else ""
         except Exception:
             pass
-        if "appears to be spam" in body:
+        if "appears to be spam" in body.lower():
             return False, (
                 "IA rejected the upload as spam. This usually means the item "
                 "needs descriptive metadata, or the account is rate limited. "
@@ -494,8 +556,14 @@ def classify(exc: Exception) -> tuple[bool, str]:
         return True, type(exc).__name__
     if isinstance(exc, requests.exceptions.RequestException):
         return True, type(exc).__name__
+    # internetarchive sometimes re-raises a raw socket-level ConnectionError
+    # (e.g. ConnectionResetError) instead of wrapping it in
+    # requests.exceptions.ConnectionError. Both are transient network
+    # conditions, not the local file error the OSError branch below is for.
+    if isinstance(exc, ConnectionError):
+        return True, type(exc).__name__
     if isinstance(exc, (OSError, IOError)):
-        return False, f"local file error: {exc}"
+        return False, f"local file error: {safe(exc)}"
     return False, f"{type(exc).__name__}: {safe(exc)}"
 
 
@@ -570,12 +638,6 @@ def upload_one(
             interrupt.sleep(sleep_for)
             delay = min(args.max_retry_wait, delay * 2)
 
-            # A fresh Item picks up any server-side state change between tries.
-            try:
-                item = get_item(item.identifier)
-            except Exception:
-                pass
-
     return Outcome.RETRY_EXHAUSTED, "retries exhausted"
 
 
@@ -589,6 +651,22 @@ def human(n: float) -> str:
             return f"{int(n)}B" if unit == "B" else f"{n:.1f}{unit}"
         n /= 1024
     return f"{n:.1f}PB"
+
+
+def rolling_rate(window: deque[tuple[float, int]], now: float, size: int, elapsed: float) -> float:
+    """Record a completed file and return bytes/sec over a recent window.
+
+    A plain lifetime average (total bytes / total elapsed since the run
+    started) stays dragged down by an early retry storm for the rest of the
+    run, long after conditions recover. This looks only at RATE_WINDOW_SECONDS
+    of recent history instead, aging out anything older.
+    """
+    window.append((now, size))
+    while window and now - window[0][0] > RATE_WINDOW_SECONDS:
+        window.popleft()
+    window_bytes = sum(s for _, s in window)
+    window_span = max(now - window[0][0], elapsed, 0.001)
+    return window_bytes / window_span
 
 
 def clock(seconds: float) -> str:
@@ -760,6 +838,7 @@ def main() -> int:
 
     root = args.source.resolve()
     state_path = args.state or Path(f".ia_upload_{args.identifier}.json")
+    acquire_lock(state_path.with_name(state_path.name + ".lock"))
     state = State.load(state_path, args.identifier)
     interrupt = Interrupt(on_abort=lambda: state.save(force=True))
 
@@ -770,7 +849,7 @@ def main() -> int:
         log.error("No files found to upload.")
         return 1
 
-    problems = check_names(files)
+    problems = check_names(files, args.identifier)
     if problems:
         log.error("%d filename problem(s) that IA will reject:", len(problems))
         for line in problems[:20]:
@@ -886,6 +965,10 @@ def main() -> int:
     failed: list[tuple[LocalFile, str]] = []
     sent_bytes = 0
     started = time.time()
+    # (timestamp, bytes) of recent completions, for a recency-weighted ETA.
+    # A plain lifetime average would stay dragged down by an early retry
+    # storm for the rest of the run, long after conditions recover.
+    rate_window: deque[tuple[float, int]] = deque()
     stop_all = False
 
     for i, f in enumerate(pending, 1):
@@ -920,7 +1003,7 @@ def main() -> int:
             succeeded.append(f)
             sent_bytes += f.size
             state.mark(f.remote_name, f.md5)
-            overall = sent_bytes / max(time.time() - started, 0.001)
+            overall = rolling_rate(rate_window, time.time(), f.size, elapsed)
             remaining = pending_bytes - sent_bytes
             log.info(
                 "    done: %s in %s (%s/s). %s to go, ETA %s.",
@@ -1007,3 +1090,8 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(130)
+    except Exception:
+        # An unexpected bug, not a handled failure. Get it into --log (not
+        # just stderr) so a crash hours into an unattended run leaves a trace.
+        logging.getLogger("ia_upload").exception("Unexpected error; this is a bug.")
+        sys.exit(1)

@@ -117,6 +117,8 @@ seconds.
 * Never follows symlinks. Prompts before overwriting a file whose contents
   differ, since IA keeps the old copy and it still counts against the item.
 * Redacts anything shaped like an S3 credential from logs.
+* Refuses to start a second run against the same state file (e.g. an
+  overlapping cron job) instead of racing it.
 
 ## Documentation
 

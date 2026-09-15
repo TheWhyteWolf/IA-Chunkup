@@ -115,14 +115,17 @@ IA's task rate limits on a large item.
 .SS "Retries and pacing"
 .TP
 .BI \-\-retries " N"
-Attempts per file (default: 12). Backoff is exponential with jitter, so 12
-attempts already spans several hours; there is little reason to raise it.
+Attempts per file (default: 12). Backoff is exponential with jitter: with the
+other defaults unchanged, 12 attempts spans roughly 30 minutes to 2 hours of
+cumulative waiting before giving up on a single file; there is little reason
+to raise it.
 .TP
 .BI \-\-retry\-wait " SEC"
 Delay before the first retry (default: 15). Doubles after each failure.
 .TP
 .BI \-\-max\-retry\-wait " SEC"
-Ceiling on the backoff delay (default: 600).
+Ceiling on the backoff delay before jitter is applied (default: 600). Jitter
+can push an individual wait up to 1.5x this value.
 .TP
 .BI \-\-wait\-between " SEC"
 Pause between files (default: 0). Raise this if IA starts returning 503
@@ -219,6 +222,13 @@ Credentials written by
 .TP
 .IB .ia_upload_ IDENTIFIER .json
 Default resume state, in the working directory.
+.TP
+.IB .ia_upload_ IDENTIFIER .json.lock
+Advisory lock held for the duration of the run, so a second run against the
+same state file (an overlapping cron job, say) refuses to start instead of
+racing on it. Removed automatically on exit. If a run is killed hard enough
+to leave this behind, the next run detects that its process is gone and
+reclaims it automatically.
 .
 .SH EXAMPLES
 .PP
